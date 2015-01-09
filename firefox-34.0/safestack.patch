@@ -1,0 +1,134 @@
+diff -r f8c9a51bd076 js/src/gc/FindSCCs.h
+--- a/js/src/gc/FindSCCs.h	Wed Nov 26 18:38:53 2014 -0500
++++ b/js/src/gc/FindSCCs.h	Fri Jan 09 14:55:55 2015 +0100
+@@ -148,8 +148,9 @@
+         v->gcNextGraphNode = stack;
+         stack = v;
+ 
+-        int stackDummy;
+-        if (stackFull || !JS_CHECK_STACK_SIZE(stackLimit, &stackDummy)) {
++        void *stackSp;
++        JS_GET_STACK_PTR(stackSp);
++        if (stackFull || !JS_CHECK_STACK_SIZE(stackLimit, stackSp)) {
+             stackFull = true;
+             return;
+         }
+diff -r f8c9a51bd076 js/src/gc/Marking.cpp
+--- a/js/src/gc/Marking.cpp	Wed Nov 26 18:38:53 2014 -0500
++++ b/js/src/gc/Marking.cpp	Fri Jan 09 14:55:55 2015 +0100
+@@ -1952,8 +1952,9 @@
+ UnmarkGrayChildren(JSTracer *trc, void **thingp, JSGCTraceKind kind)
+ {
+     void *thing = *thingp;
+-    int stackDummy;
+-    if (!JS_CHECK_STACK_SIZE(trc->runtime()->mainThread.nativeStackLimit[StackForSystemCode], &stackDummy)) {
++    void *stackSp;
++    JS_GET_STACK_PTR(stackSp);
++    if (!JS_CHECK_STACK_SIZE(trc->runtime()->mainThread.nativeStackLimit[StackForSystemCode], stackSp)) {
+         /*
+          * If we run out of stack, we take a more drastic measure: require that
+          * we GC again before the next CC.
+diff -r f8c9a51bd076 js/src/jit/BaselineJIT.cpp
+--- a/js/src/jit/BaselineJIT.cpp	Wed Nov 26 18:38:53 2014 -0500
++++ b/js/src/jit/BaselineJIT.cpp	Fri Jan 09 14:55:55 2015 +0100
+@@ -87,9 +87,10 @@
+ {
+     if (data.osrFrame) {
+         // Check for potential stack overflow before OSR-ing.
+-        uint8_t spDummy;
+         uint32_t extra = BaselineFrame::Size() + (data.osrNumStackValues * sizeof(Value));
+-        uint8_t *checkSp = (&spDummy) - extra;
++        void *checkSp;
++        JS_GET_STACK_PTR(checkSp);
++        checkSp = (void *)(((uint8_t *)checkSp) + extra);
+         JS_CHECK_RECURSION_WITH_SP(cx, checkSp, return IonExec_Aborted);
+     } else {
+         JS_CHECK_RECURSION(cx, return IonExec_Aborted);
+diff -r f8c9a51bd076 js/src/jit/ParallelFunctions.cpp
+--- a/js/src/jit/ParallelFunctions.cpp	Wed Nov 26 18:38:53 2014 -0500
++++ b/js/src/jit/ParallelFunctions.cpp	Fri Jan 09 14:55:55 2015 +0100
+@@ -131,7 +131,6 @@
+ jit::CheckOverRecursedPar(ForkJoinContext *cx)
+ {
+     JS_ASSERT(ForkJoinContext::current() == cx);
+-    int stackDummy_;
+ 
+     // In PJS, unlike sequential execution, we don't overwrite the stack limit
+     // on interrupt, but we do still call into this routine if the interrupt
+@@ -144,7 +143,9 @@
+     }
+ #endif
+ 
+-    if (!JS_CHECK_STACK_SIZE(cx->perThreadData->jitStackLimit, &stackDummy_)) {
++    void *stackSp;
++    JS_GET_STACK_PTR(stackSp);
++    if (!JS_CHECK_STACK_SIZE(cx->perThreadData->jitStackLimit, stackSp)) {
+         cx->bailoutRecord->joinCause(ParallelBailoutOverRecursed);
+         return false;
+     }
+diff -r f8c9a51bd076 js/src/jit/VMFunctions.cpp
+--- a/js/src/jit/VMFunctions.cpp	Wed Nov 26 18:38:53 2014 -0500
++++ b/js/src/jit/VMFunctions.cpp	Fri Jan 09 14:55:55 2015 +0100
+@@ -152,8 +152,9 @@
+     // See |CheckOverRecursed| above.  This is a variant of that function which
+     // accepts an argument holding the extra stack space needed for the Baseline
+     // frame that's about to be pushed.
+-    uint8_t spDummy;
+-    uint8_t *checkSp = (&spDummy) - extra;
++    void *checkSp;
++    JS_GET_STACK_PTR(checkSp);
++    checkSp = (void *)(((uint8_t *)checkSp) + extra);
+     if (earlyCheck) {
+ #if defined(JS_ARM_SIMULATOR) || defined(JS_MIPS_SIMULATOR)
+         (void)checkSp;
+diff -r f8c9a51bd076 js/src/jsfriendapi.h
+--- a/js/src/jsfriendapi.h	Wed Nov 26 18:38:53 2014 -0500
++++ b/js/src/jsfriendapi.h	Fri Jan 09 14:55:55 2015 +0100
+@@ -997,10 +997,24 @@
+  * a little more from it).
+  */
+ 
++#if defined(__GNUC__) || defined(__clang__)
++# define JS_GET_STACK_PTR(ptr)                                                  \
++    JS_BEGIN_MACRO                                                              \
++        ptr = __builtin_frame_address(0);                                       \
++    JS_END_MACRO
++#else
++# define JS_GET_STACK_PTR(ptr)                                                  \
++    JS_BEGIN_MACRO                                                              \
++        int stackDummy_;                                                        \
++        ptr = (void *)&stackDummy_;                                             \
++    JS_END_MACRO
++#endif
++
+ #define JS_CHECK_RECURSION_LIMIT(cx, limit, onerror)                            \
+     JS_BEGIN_MACRO                                                              \
+-        int stackDummy_;                                                        \
+-        if (!JS_CHECK_STACK_SIZE(limit, &stackDummy_)) {                        \
++        void *ptr;                                                              \
++        JS_GET_STACK_PTR(ptr);                                                  \
++        if (!JS_CHECK_STACK_SIZE(limit, ptr)) {                                 \
+             js_ReportOverRecursed(cx);                                          \
+             onerror;                                                            \
+         }                                                                       \
+@@ -1011,8 +1025,9 @@
+ 
+ #define JS_CHECK_RECURSION_DONT_REPORT(cx, onerror)                             \
+     JS_BEGIN_MACRO                                                              \
+-        int stackDummy_;                                                        \
+-        if (!JS_CHECK_STACK_SIZE(js::GetNativeStackLimit(cx), &stackDummy_)) {  \
++        void *ptr;                                                              \
++        JS_GET_STACK_PTR(ptr);                                                  \
++        if (!JS_CHECK_STACK_SIZE(js::GetNativeStackLimit(cx), ptr)) {           \
+             onerror;                                                            \
+         }                                                                       \
+     JS_END_MACRO
+diff -r f8c9a51bd076 js/src/tests/jstests.py
+--- a/js/src/tests/jstests.py	Wed Nov 26 18:38:53 2014 -0500
++++ b/js/src/tests/jstests.py	Fri Jan 09 14:55:55 2015 +0100
+@@ -1,4 +1,4 @@
+-#!/usr/bin/env python
++#!/usr/bin/env python2
+ """
+ The JS Shell Test Harness.
+ 
